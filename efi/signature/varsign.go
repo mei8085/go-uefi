@@ -51,8 +51,27 @@ type WINCertificate struct {
 
 const SizeofWINCertificate = 4 + 2 + 2
 
-var ErrParse = errors.New("could not parse struct")
+var (
+	ErrParse = errors.New("could not parse struct")
 
+	// ErrCertificateTableLength is returned when a WIN_CERTIFICATE entry
+	// declares a length that does not fit inside the certificate table (or
+	// reader) it is part of. Such an entry can be used to smuggle bytes past
+	// the parser while still producing a superficially valid structure.
+	ErrCertificateTableLength = errors.New("WIN_CERTIFICATE length exceeds certificate table bounds")
+
+	// ErrCertificateType is returned when a WIN_CERTIFICATE entry uses a
+	// certificate type that is not recognised.
+	ErrCertificateType = errors.New("unknown WIN_CERTIFICATE certificate type")
+)
+
+// ReadWinCertificate reads a single WIN_CERTIFICATE structure from f.
+//
+// The PE/COFF and UEFI specifications require the dwLength field to cover the
+// entire structure (the 8 byte header plus the bCertificate data) and to be
+// 8-byte aligned inside the Attribute Certificate Table. The length is
+// validated against the remaining bytes of f so a forged, oversized length can
+// never cause an out-of-bounds read or silently consume unrelated data.
 func ReadWinCertificate(f io.Reader) (WINCertificate, error) {
 	var cert WINCertificate
 	for _, v := range []interface{}{&cert.Length, &cert.Revision, &cert.CertType} {
@@ -63,9 +82,28 @@ func ReadWinCertificate(f io.Reader) (WINCertificate, error) {
 	if cert.Revision != WIN_CERTIFICATE_REVISION {
 		return WINCertificate{}, errors.Wrapf(ErrParse, "WINCertificate revision should be %x, but is %x. Malformed or invalid", WIN_CERTIFICATE_REVISION, cert.Revision)
 	}
-	certLength := make([]byte, cert.Length-SizeofWINCertificate)
-	if err := binary.Read(f, binary.LittleEndian, certLength); err != nil {
-		return WINCertificate{}, errors.Wrapf(err, "could not get signature data")
+
+	// The length must at least cover the fixed header and must not overflow.
+	if cert.Length < SizeofWINCertificate {
+		return WINCertificate{}, errors.Wrapf(ErrCertificateTableLength, "WIN_CERTIFICATE length %d is smaller than the %d byte header", cert.Length, SizeofWINCertificate)
+	}
+
+	certLen := int64(cert.Length) - SizeofWINCertificate
+
+	// Bound the declared length against the data that is actually available.
+	// A bytes.Reader (the normal caller) reports its remaining bytes through
+	// Len(); any other reader is trusted to return io.EOF once exhausted.
+	var remaining int64 = -1
+	if l, ok := f.(interface{ Len() int }); ok {
+		remaining = int64(l.Len())
+	}
+	if remaining >= 0 && certLen > remaining {
+		return WINCertificate{}, errors.Wrapf(ErrCertificateTableLength, "WIN_CERTIFICATE declares %d certificate bytes but only %d bytes remain in the certificate table", certLen, remaining)
+	}
+
+	certLength := make([]byte, certLen)
+	if _, err := io.ReadFull(f, certLength); err != nil {
+		return WINCertificate{}, errors.Wrapf(ErrCertificateTableLength, "could not read %d bytes of WIN_CERTIFICATE data: %v", certLen, err)
 	}
 	cert.Certificate = certLength[:]
 	return cert, nil
@@ -101,15 +139,20 @@ func ReadWinCertificateUEFIGUID(f io.Reader) (WinCertificateUEFIGUID, error) {
 		return WinCertificateUEFIGUID{}, errors.Wrap(err, "could not parse WINCert UEFI_GUID")
 	}
 	cert.Header = hdr
-	reader := bytes.NewBuffer(cert.Header.Certificate)
-	if err := binary.Read(reader, binary.LittleEndian, &cert.CertType); err != nil {
-		log.Fatal(err)
+
+	// The remaining certificate bytes must contain exactly one EFI GUID and
+	// the opaque certificate data. A short buffer means a truncated entry.
+	if uint32(len(hdr.Certificate)) < util.SizeofEFIGUID {
+		return WinCertificateUEFIGUID{}, errors.Wrapf(ErrCertificateTableLength, "WIN_CERTIFICATE_UEFI_GUID has %d certificate bytes, need at least %d for the GUID", len(hdr.Certificate), util.SizeofEFIGUID)
 	}
-	rbuf := make([]byte, reader.Len())
-	if err := binary.Read(reader, binary.LittleEndian, rbuf); err != nil {
-		log.Fatal(err)
+	cert.CertType = util.EFIGUID{
+		Data1: binary.LittleEndian.Uint32(hdr.Certificate[0:4]),
+		Data2: binary.LittleEndian.Uint16(hdr.Certificate[4:6]),
+		Data3: binary.LittleEndian.Uint16(hdr.Certificate[6:8]),
 	}
-	cert.CertData = rbuf[:]
+	copy(cert.CertType.Data4[:], hdr.Certificate[8:util.SizeofEFIGUID])
+	// Defensive copy so callers cannot alias and mutate the table buffer.
+	cert.CertData = append([]byte(nil), hdr.Certificate[util.SizeofEFIGUID:]...)
 	return cert, nil
 }
 
@@ -250,7 +293,7 @@ func SignEFIVariable(v efivar.Efivar, m efivar.Marshallable, key crypto.Signer, 
 func ReadEFIVariableAuthencation2(f io.Reader) (*EFIVariableAuthentication2, error) {
 	var efi EFIVariableAuthentication2
 	if err := binary.Read(f, binary.LittleEndian, &efi.Time); err != nil {
-		log.Fatal(err)
+		return nil, errors.Wrap(err, "could not parse EFI time")
 	}
 	authinfo, err := ReadWinCertificateUEFIGUID(f)
 	if err != nil {
@@ -258,7 +301,10 @@ func ReadEFIVariableAuthencation2(f io.Reader) (*EFIVariableAuthentication2, err
 	}
 	efi.AuthInfo = authinfo
 	if efi.AuthInfo.Header.CertType != WIN_CERT_TYPE_EFI_GUID {
-		log.Fatalf("EFI_VARIABLE_AUTHENTICATION2 accepts only CertType WIN_CERT_TYPE_EFI_GUID. Got: %x", efi.AuthInfo.CertType)
+		return nil, errors.Wrapf(ErrCertificateType, "EFI_VARIABLE_AUTHENTICATION2 accepts only CertType WIN_CERT_TYPE_EFI_GUID. Got: %x", efi.AuthInfo.Header.CertType)
+	}
+	if !util.CmpEFIGUID(efi.AuthInfo.CertType, EFI_CERT_TYPE_PKCS7_GUID) {
+		return nil, errors.Wrapf(ErrCertificateType, "EFI_VARIABLE_AUTHENTICATION2 accepts only the EFI_CERT_TYPE_PKCS7_GUID certificate type. Got: %s", efi.AuthInfo.CertType.Format())
 	}
 	return &efi, nil
 }

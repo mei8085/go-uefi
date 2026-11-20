@@ -53,6 +53,22 @@ var (
 	ErrTimestampRequest  = errors.New("timestamp request failed")
 	ErrTimestampResponse = errors.New("invalid timestamp response")
 	ErrTimestampVerify   = errors.New("timestamp verification failed")
+
+	// ErrTrailingData is returned when an ASN.1 structure contains bytes
+	// after its outermost element. Such bytes are not covered by the signature
+	// and would otherwise be silently ignored while the structure still
+	// parses.
+	ErrTrailingData = errors.New("trailing data after ASN.1 structure")
+
+	// ErrMultipleSigners is returned when the SignedData structure contains
+	// more than one SignerInfo. Authenticode signatures are single-signer and
+	// the verification path only evaluates the first entry.
+	ErrMultipleSigners = errors.New("multiple SignerInfo entries are not supported")
+
+	// ErrNoAuthenticatedAttributes is returned when a SignerInfo carries no
+	// authenticatedAttributes. The Authenticode signature is computed over
+	// those attributes, so without them there is nothing to verify.
+	ErrNoAuthenticatedAttributes = errors.New("signer info has no authenticated attributes")
 )
 
 type Config struct {
@@ -305,7 +321,7 @@ func ParseAlgorithmIdentifier(der *cryptobyte.String) (*pkix.AlgorithmIdentifier
 	}
 
 	if !s.ReadASN1ObjectIdentifier(&ident.Algorithm) {
-		return nil, errors.New("missing missing algorithmIdentifier")
+		return nil, errors.New("missing algorithmIdentifier")
 	}
 
 	if s.Empty() {
@@ -314,9 +330,15 @@ func ParseAlgorithmIdentifier(der *cryptobyte.String) (*pkix.AlgorithmIdentifier
 
 	var asn1Null cryptobyte.String
 	if !s.ReadASN1(&asn1Null, asn1.NULL) {
-		return nil, errors.New("missing missing algorithmIdentifier")
+		return nil, errors.New("missing algorithmIdentifier parameters (expected NULL)")
 	}
-	// TODO: Support paramters, we don't use it currently
+
+	// Reject anything but the single NULL parameter. An unexpected parameter
+	// would be parsed structurally but never evaluated by the verifier.
+	if !s.Empty() {
+		return nil, fmt.Errorf("%w: %d unconsumed byte(s) in AlgorithmIdentifier", ErrTrailingData, len(s))
+	}
+	// TODO: Support parameters, we don't use it currently
 	return &ident, nil
 }
 
@@ -344,6 +366,13 @@ func ParseContentInfo(der *cryptobyte.String) (oid encasn1.ObjectIdentifier, con
 
 	if !s.ReadOptionalASN1(&content, nil, asn1.Tag(0).ContextSpecific().Constructed()) {
 		return nil, nil, errors.New("no contentinfo content")
+	}
+
+	// The ContentInfo SEQUENCE itself only ever holds the OID and the
+	// optional explicit content. Anything left inside it is unsigned data
+	// wearing a ContentInfo wrapper.
+	if !s.Empty() {
+		return nil, nil, fmt.Errorf("%w: %d unconsumed byte(s) inside ContentInfo", ErrTrailingData, len(s))
 	}
 
 	return
@@ -475,16 +504,25 @@ func parseAttributes(der *cryptobyte.String, tag int) (*Attributes, error) {
 			if !contentType.ReadASN1(&digest, asn1.OCTET_STRING) {
 				return nil, errors.New("could not parse message digest")
 			}
+			if !contentType.Empty() {
+				return nil, fmt.Errorf("%w: extra bytes in messageDigest attribute", ErrTrailingData)
+			}
 			attributes.MessageDigest = digest
 		case contentOID.Equal(OIDAttributeContentType):
 			var contentTypeOID encasn1.ObjectIdentifier
 			if !contentType.ReadASN1ObjectIdentifier(&contentTypeOID) {
 				return nil, errors.New("could not parse Content Type")
 			}
+			if !contentType.Empty() {
+				return nil, fmt.Errorf("%w: extra bytes in contentType attribute", ErrTrailingData)
+			}
 			attributes.ContentType = contentTypeOID
 		case contentOID.Equal(OIDAttributeSigningTime):
 			if !contentType.ReadASN1UTCTime(&attributes.SigningTime) {
 				return nil, errors.New("could not parse Signing Time")
+			}
+			if !contentType.Empty() {
+				return nil, fmt.Errorf("%w: extra bytes in signingTime attribute", ErrTrailingData)
 			}
 		case contentOID.Equal(OIDAttributeMicrosoftTimeStamp):
 			attributes.TimestampToken = contentType
@@ -561,6 +599,13 @@ func parseSignerInfos(der *cryptobyte.String) (*signerinfo, error) {
 	}
 	si.UnauthenticatedAttributes = unauthAttrs
 
+	// Every byte of the SignerInfo SEQUENCE must belong to a parsed field.
+	// Leftover bytes would be structurally present but neither parsed nor
+	// covered by any explicit check, which is exactly where bypass data hides.
+	if !signerInfo.Empty() {
+		return nil, fmt.Errorf("%w: %d unconsumed byte(s) in SignerInfo", ErrTrailingData, len(signerInfo))
+	}
+
 	return &si, nil
 }
 
@@ -576,6 +621,9 @@ type signerinfo struct {
 }
 
 func (s *signerinfo) verify(cert *x509.Certificate) (bool, error) {
+	if s.AuthenticatedAttributes == nil || len(s.AuthenticatedAttributes.RawBytes) == 0 {
+		return false, ErrNoAuthenticatedAttributes
+	}
 	sigdata := s.AuthenticatedAttributes.RawBytes
 	err := cert.CheckSignature(x509.SHA256WithRSA, sigdata, s.EncryptedDigest)
 	if err != nil {
@@ -625,7 +673,11 @@ type PKCS7 struct {
 }
 
 // verifyHash checks that the hash of ContentInfo matches the hash from the
-// authenticated attributes which the signatures are done over
+// authenticated attributes which the signatures are done over.
+// A mismatch returns (false, nil): the signature is simply not valid for this
+// content, and the caller reports it as ErrNoValidSignatures. Structural
+// problems (malformed content, missing authenticated attributes) return an
+// error because the blob cannot be evaluated at all.
 // TODO: Move this to the authenticode package
 // TODO: make signerinfo public
 func (p *PKCS7) verifyHash(si *signerinfo) (bool, error) {
@@ -638,12 +690,12 @@ func (p *PKCS7) verifyHash(si *signerinfo) (bool, error) {
 	if !content.ReadASN1(&spcIndirectDataContent, asn1.SEQUENCE) || !content.Empty() {
 		return false, errors.New("malformed SpcIndirectDataContent")
 	}
+	if si.AuthenticatedAttributes == nil || len(si.AuthenticatedAttributes.MessageDigest) == 0 {
+		return false, errors.New("signer info has no authenticated messageDigest attribute")
+	}
 	hh := crypto.SHA256.New()
 	hh.Write(spcIndirectDataContent)
-	if bytes.Equal(si.AuthenticatedAttributes.MessageDigest, hh.Sum(nil)) {
-		return true, nil
-	}
-	return false, nil
+	return bytes.Equal(si.AuthenticatedAttributes.MessageDigest, hh.Sum(nil)), nil
 }
 
 func (p *PKCS7) Verify(cert *x509.Certificate, opts ...VerifyOption) (bool, error) {
@@ -693,13 +745,28 @@ func ParsePKCS7(b []byte) (*PKCS7, error) {
 	contentInfo := cryptobyte.String(b)
 
 	var oid encasn1.ObjectIdentifier
-	if ok, err := hasContentInfo(&contentInfo); ok {
-		oid, contentInfo, err = ParseContentInfo(&contentInfo)
+	ok, err := hasContentInfo(&contentInfo)
+	if err != nil {
+		return nil, fmt.Errorf("failed checking content info: %w", err)
+	}
+	if ok {
+		// ParseContentInfo advances contentInfo past the outer ContentInfo
+		// SEQUENCE and returns the explicit [0] content separately.
+		var signedContent cryptobyte.String
+		oid, signedContent, err = ParseContentInfo(&contentInfo)
 		if err != nil {
 			return nil, fmt.Errorf("failed parsing contenting info: %w", err)
 		}
-	} else if err != nil {
-		return nil, fmt.Errorf("failed checking content info: %w", err)
+
+		// The blob must contain exactly one ContentInfo. Bytes appended after
+		// it are outside every signed structure and would otherwise be
+		// silently ignored.
+		if !contentInfo.Empty() {
+			return nil, fmt.Errorf("%w: %d unconsumed byte(s) after outer ContentInfo", ErrTrailingData, len(contentInfo))
+		}
+
+		// contentInfo now holds the explicit [0] content (the SignedData).
+		contentInfo = signedContent
 	}
 
 	pkcs.OID = oid
@@ -707,6 +774,12 @@ func ParsePKCS7(b []byte) (*PKCS7, error) {
 	var signedData cryptobyte.String
 	if !contentInfo.ReadASN1(&signedData, asn1.SEQUENCE) {
 		return nil, errors.New("no signed data")
+	}
+
+	// The explicit [0] content must contain exactly one SignedData SEQUENCE.
+	// Anything else would sit outside every signed structure.
+	if !contentInfo.Empty() {
+		return nil, fmt.Errorf("%w: %d unconsumed byte(s) after SignedData", ErrTrailingData, len(contentInfo))
 	}
 
 	var version int64
@@ -719,13 +792,20 @@ func ParsePKCS7(b []byte) (*PKCS7, error) {
 		return nil, errors.New("no digest crypto")
 	}
 
+	// The DigestAlgorithmIdentifiers SET must contain exactly one fully
+	// consumed AlgorithmIdentifier. Extra entries would name digest
+	// algorithms the verification path never evaluates.
 	algid, err := ParseAlgorithmIdentifier(&digest)
 	if err != nil {
 		return nil, fmt.Errorf("failed algorithm identifier: %w", err)
 	}
+	if !digest.Empty() {
+		return nil, fmt.Errorf("%w: %d unconsumed byte(s) in digestAlgorithms", ErrTrailingData, len(digest))
+	}
 	pkcs.AlgorithmIdentifier = algid
 
-	oid, content, err := ParseContentInfo(&signedData)
+	var content cryptobyte.String
+	oid, content, err = ParseContentInfo(&signedData)
 	if err != nil {
 		return nil, fmt.Errorf("failed parsing content info: %w", err)
 	}
@@ -748,12 +828,25 @@ func ParsePKCS7(b []byte) (*PKCS7, error) {
 	if !signedData.ReadASN1(&signerInfo, asn1.SET) {
 		return nil, errors.New("no signer info")
 	}
+
+	// SignedData must be fully consumed once every field has been read.
+	if !signedData.Empty() {
+		return nil, fmt.Errorf("%w: %d unconsumed byte(s) in SignedData", ErrTrailingData, len(signedData))
+	}
+
 	for !signerInfo.Empty() {
 		si, err := parseSignerInfos(&signerInfo)
 		if err != nil {
 			return nil, fmt.Errorf("failed parsing signer info: %w", err)
 		}
 		pkcs.SignerInfo = append(pkcs.SignerInfo, si)
+	}
+
+	// Authenticode signatures are single-signer. Additional SignerInfo
+	// entries would never be evaluated by Verify, so reject them at parse
+	// time instead of pretending the structure is fully validated.
+	if len(pkcs.SignerInfo) != 1 {
+		return nil, fmt.Errorf("%w: expected exactly one SignerInfo, got %d", ErrMultipleSigners, len(pkcs.SignerInfo))
 	}
 
 	return &pkcs, nil

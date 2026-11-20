@@ -26,6 +26,20 @@ var (
 	OIDMicrosoftIndividualCodeSigning = encasn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 2, 1, 21}
 )
 
+// Errors returned by Authenticode parsing and verification. They are exported
+// so callers can distinguish a structurally invalid signature (which must be
+// rejected outright) from a signature that simply fails to validate.
+var (
+	// ErrMalformedSpcIndirectData is returned when the SPC_INDIRECT_DATA
+	// content cannot be strictly parsed or contains bytes outside its
+	// declared ASN.1 boundaries.
+	ErrMalformedSpcIndirectData = errors.New("malformed SPC_INDIRECT_DATA content")
+
+	// ErrDigestMismatch is returned when the digest computed over the image
+	// does not equal the digest embedded in the (signed) SPC_INDIRECT_DATA.
+	ErrDigestMismatch = errors.New("image digest does not match the authenticated digest")
+)
+
 // Authenticode represents an authenticode signature.
 type Authenticode struct {
 	Pkcs   *pkcs7.PKCS7
@@ -35,6 +49,10 @@ type Authenticode struct {
 
 // Verify validates an authenticode signature.
 // Note it doesn't validate x509 certificate chains.
+//
+// The image is hashed and compared against the digest embedded in the signed
+// SPC_INDIRECT_DATA. A mismatch returns ErrDigestMismatch so callers can tell
+// a tampered (or appended-to) image apart from an untrusted certificate.
 func (a *Authenticode) Verify(cert *x509.Certificate, img io.Reader, opts ...pkcs7.VerifyOption) (bool, error) {
 	var h hash.Hash
 	switch {
@@ -54,7 +72,7 @@ func (a *Authenticode) Verify(cert *x509.Certificate, img io.Reader, opts ...pkc
 
 	digest := h.Sum(nil)
 	if !bytes.Equal(digest, a.Digest) {
-		return false, errors.New("incorrect digest")
+		return false, fmt.Errorf("%w: expected %x, got %x", ErrDigestMismatch, a.Digest, digest)
 	}
 	return a.Pkcs.Verify(cert, opts...)
 }
@@ -145,6 +163,13 @@ func SignAuthenticode(signer crypto.Signer, cert *x509.Certificate, digest io.Re
 }
 
 // ParseAuthenticode parses an Authenticode signature.
+//
+// Every ASN.1 level is parsed to completion. The signed SPC_INDIRECT_DATA
+// content is the boundary that the signature digest covers: any byte left over
+// inside or between its elements is data the signature does not authenticate,
+// so it is rejected rather than silently skipped. Structural failures are
+// wrapped around ErrMalformedSpcIndirectData (or the underlying pkcs7 errors)
+// so callers can identify them through errors.Is.
 func ParseAuthenticode(b []byte) (*Authenticode, error) {
 	var auth Authenticode
 	pkcs, err := pkcs7.ParsePKCS7(b)
@@ -158,47 +183,66 @@ func ParseAuthenticode(b []byte) (*Authenticode, error) {
 
 	auth.Pkcs = pkcs
 
+	// The explicit content must hold exactly one SPC_INDIRECT_DATA SEQUENCE.
 	der := cryptobyte.String(pkcs.ContentInfo)
-	if !der.ReadASN1(&der, asn1.SEQUENCE) {
-		return nil, errors.New("no spcindirectdatacontent")
+	var indirectData cryptobyte.String
+	if !der.ReadASN1(&indirectData, asn1.SEQUENCE) {
+		return nil, fmt.Errorf("%w: no SPC_INDIRECT_DATA SEQUENCE", ErrMalformedSpcIndirectData)
+	}
+	if !der.Empty() {
+		return nil, fmt.Errorf("%w: %d unconsumed byte(s) after SPC_INDIRECT_DATA", ErrMalformedSpcIndirectData, len(der))
 	}
 
+	// First element: SpcAttributeTypeAndOptionalValue.
 	var spcdata cryptobyte.String
-	if !der.ReadASN1(&spcdata, asn1.SEQUENCE) {
-		return nil, errors.New("no spcindirectdatacontent")
+	if !indirectData.ReadASN1(&spcdata, asn1.SEQUENCE) {
+		return nil, fmt.Errorf("%w: missing SpcAttributeTypeAndOptionalValue", ErrMalformedSpcIndirectData)
 	}
 
 	var dtype encasn1.ObjectIdentifier
 	if !spcdata.ReadASN1ObjectIdentifier(&dtype) {
-		return nil, errors.New("missing objectid type")
+		return nil, fmt.Errorf("%w: missing objectid type", ErrMalformedSpcIndirectData)
 	}
 
 	// TODO: Apparently microsoft sometimes uses a special OID for shim keys
 	if !dtype.Equal(OIDSpcPEImageDataObjID) && !dtype.Equal(OIDMicrosoftIndividualCodeSigning) {
-		return nil, fmt.Errorf("incorrect, expected %v, got %v", OIDSpcIndirectDataContent, dtype)
+		return nil, fmt.Errorf("%w: incorrect data type, expected %v, got %v", ErrMalformedSpcIndirectData, OIDSpcIndirectDataContent, dtype)
 	}
 
-	// TODO: We don't care about the next stuff in spcdata
-	if !spcdata.SkipASN1(asn1.SEQUENCE) {
-		return nil, errors.New("no spcpeimagedata")
+	// The SpcPeImageData (flags + SpcLink). Skip the value but enforce that
+	// nothing trails it inside SpcAttributeTypeAndOptionalValue.
+	var spcPeImageData cryptobyte.String
+	if !spcdata.ReadASN1(&spcPeImageData, asn1.SEQUENCE) {
+		return nil, fmt.Errorf("%w: no SpcPeImageData", ErrMalformedSpcIndirectData)
+	}
+	if !spcdata.Empty() {
+		return nil, fmt.Errorf("%w: %d unconsumed byte(s) in SpcAttributeTypeAndOptionalValue", ErrMalformedSpcIndirectData, len(spcdata))
 	}
 
-	if !der.ReadASN1(&der, asn1.SEQUENCE) {
-		return nil, errors.New("no spcindirectdatacontent")
+	// Second element: DigestInfo (AlgorithmIdentifier + digest OCTET STRING).
+	var digestInfo cryptobyte.String
+	if !indirectData.ReadASN1(&digestInfo, asn1.SEQUENCE) {
+		return nil, fmt.Errorf("%w: missing DigestInfo", ErrMalformedSpcIndirectData)
+	}
+	if !indirectData.Empty() {
+		return nil, fmt.Errorf("%w: %d unconsumed byte(s) in SPC_INDIRECT_DATA", ErrMalformedSpcIndirectData, len(indirectData))
 	}
 
-	algid, err := pkcs7.ParseAlgorithmIdentifier(&der)
+	algid, err := pkcs7.ParseAlgorithmIdentifier(&digestInfo)
 	if err != nil {
-		return nil, fmt.Errorf("failed parsing DigestInfo: %w", err)
+		return nil, fmt.Errorf("%w: failed parsing DigestInfo: %v", ErrMalformedSpcIndirectData, err)
 	}
 	auth.Algid = algid
 
 	var digest cryptobyte.String
-	if !der.ReadASN1(&digest, asn1.OCTET_STRING) {
-		return nil, errors.New("no spcindirectdatacontent")
+	if !digestInfo.ReadASN1(&digest, asn1.OCTET_STRING) {
+		return nil, fmt.Errorf("%w: missing digest OCTET STRING", ErrMalformedSpcIndirectData)
+	}
+	if !digestInfo.Empty() {
+		return nil, fmt.Errorf("%w: %d unconsumed byte(s) in DigestInfo", ErrMalformedSpcIndirectData, len(digestInfo))
 	}
 
 	auth.Digest = digest
 
-	return &auth, err
+	return &auth, nil
 }

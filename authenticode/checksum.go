@@ -23,6 +23,13 @@ var (
 
 	// No valid signatures where found in the binary.
 	ErrNoValidSignatures = errors.New("binary has no valid signatures")
+
+	// ErrCertificateTable is returned when the PE/COFF Attribute Certificate
+	// Table (data directory entry 4) is malformed: its declared offset or
+	// length does not match the file layout, the table does not end at the end
+	// of the file, or it contains data that is not a sequence of properly
+	// bounded, 8-byte aligned WIN_CERTIFICATE structures.
+	ErrCertificateTable = errors.New("invalid attribute certificate table")
 )
 
 // PECOFFBinary represents a parsed PE/COFF binary.
@@ -170,10 +177,36 @@ func Parse(r io.ReaderAt) (*PECOFFBinary, error) {
 
 	// rest.Len() should be the complete remaining bytes.
 	fileSize += rest.Len()
+	totalFileSize := int64(fileSize)
+
+	// Validate the Attribute Certificate Table entry against the actual file
+	// layout. The security directory is the only data directory that is an
+	// offset into the file (not an RVA) and the table must be the last thing
+	// in the image. Any mismatch lets an attacker hide unsigned bytes outside
+	// the authenticated digest while the file still parses successfully.
+	if ddEntry.Size > 0 || ddEntry.VirtualAddress != 0 {
+		tableStart := int64(ddEntry.VirtualAddress)
+		tableSize := int64(ddEntry.Size)
+		switch {
+		case ddEntry.Size == 0 || ddEntry.VirtualAddress == 0:
+			return nil, fmt.Errorf("%w: certificate table entry must have both a virtual address and a size, got va=0x%x size=%d", ErrCertificateTable, ddEntry.VirtualAddress, ddEntry.Size)
+		case tableStart < sumOfBytesHashed:
+			return nil, fmt.Errorf("%w: certificate table offset 0x%x overlaps hashed image content (ends at 0x%x)", ErrCertificateTable, tableStart, sumOfBytesHashed)
+		case tableSize < signature.SizeofWINCertificate:
+			return nil, fmt.Errorf("%w: certificate table size %d is smaller than a single WIN_CERTIFICATE header (%d bytes)", ErrCertificateTable, ddEntry.Size, signature.SizeofWINCertificate)
+		case tableStart+tableSize > totalFileSize:
+			return nil, fmt.Errorf("%w: certificate table (offset 0x%x, size %d) extends past the end of the file (size %d)", ErrCertificateTable, tableStart, ddEntry.Size, totalFileSize)
+		case tableStart+tableSize != totalFileSize:
+			return nil, fmt.Errorf("%w: %d unauthenticated byte(s) trail the certificate table; the table must end at end of file", ErrCertificateTable, totalFileSize-(tableStart+tableSize))
+		}
+	}
 
 	// length minus the certificate directory size
 	// this should give us a buffer with everything up ontil the certificates we can hash.
 	binaryRest := rest.Len() - int(ddEntry.Size)
+	if binaryRest < 0 {
+		return nil, fmt.Errorf("%w: certificate table size %d exceeds the %d remaining file bytes", ErrCertificateTable, ddEntry.Size, rest.Len())
+	}
 
 	// Truncate the buffer with buffer length.
 	rest.Truncate(binaryRest)
@@ -203,6 +236,17 @@ func Parse(r io.ReaderAt) (*PECOFFBinary, error) {
 	sr := io.NewSectionReader(r, int64(ddEntry.VirtualAddress), int64(ddEntry.Size))
 	if _, err := io.Copy(&certTable, sr); err != nil {
 		return nil, err
+	}
+
+	// Walk every WIN_CERTIFICATE entry while we still know the declared table
+	// bounds. This rejects forged dwLength values, non-8-byte-aligned entries
+	// and any padding that carries data instead of zeroes. The hash itself
+	// excludes this table, so without an explicit boundary check arbitrary
+	// unsigned bytes could be appended here without affecting verification.
+	if ddEntry.Size > 0 {
+		if err := validateCertificateTable(certTable.Bytes()); err != nil {
+			return nil, err
+		}
 	}
 
 	return &PECOFFBinary{
@@ -280,6 +324,13 @@ func (p *PECOFFBinary) Verify(cert *x509.Certificate, opts ...pkcs7.VerifyOption
 		return false, ErrNoSignatures
 	}
 	for _, sig := range sigs {
+		// Only PKCS#7 signed-data entries can carry an Authenticode
+		// signature. Anything else in the table is unsigned structural data
+		// and must not be treated as a candidate signature.
+		if sig.CertType != signature.WIN_CERT_TYPE_PKCS_SIGNED_DATA {
+			return false, fmt.Errorf("%w: unsupported WIN_CERTIFICATE type 0x%x in certificate table", ErrCertificateTable, uint16(sig.CertType))
+		}
+
 		authcode, err := ParseAuthenticode(sig.Certificate)
 		if err != nil {
 			return false, fmt.Errorf("failed parsing pkcs7 signature from binary: %w", err)
@@ -294,7 +345,7 @@ func (p *PECOFFBinary) Verify(cert *x509.Certificate, opts ...pkcs7.VerifyOption
 		}
 		return true, nil
 	}
-	return false, ErrNoValidSignatures
+	return false, fmt.Errorf("%w: no signature in the certificate table authenticated this image", ErrNoValidSignatures)
 }
 
 // Bytes returns the binary with any appended signatures
@@ -337,25 +388,128 @@ func (p *PECOFFBinary) signatureBytes() []byte {
 	return p.certTable.Bytes()
 }
 
+// validateCertificateTable walks the raw Attribute Certificate Table and
+// enforces the layout rules from the PE/COFF specification (section "The
+// Attribute Certificate Table") and the UEFI specification (section
+// "WIN_CERTIFICATE").
+//
+// The table is a concatenation of WIN_CERTIFICATE structures. Each structure
+// starts on an 8-byte boundary; its dwLength covers the header and the
+// certificate data but not the alignment padding, which must be zeroes. The
+// table is excluded from the Authenticode image hash, which means every byte
+// here is unauthenticated at the digest level: the only thing preventing an
+// attacker from smuggling data into it is strict structural validation. This
+// function therefore rejects:
+//
+//   - entries whose dwLength does not cover the 8 byte header or overshoots
+//     the declared table bounds (so a forged length cannot hide trailing data)
+//   - entries that do not start on an 8-byte boundary
+//   - non-zero padding bytes between entries (padding must be zeroes)
+//   - unknown certificate types and entries that do not carry any data
+//   - a table whose declared size does not end exactly on the last entry's
+//     8-byte aligned boundary
+//
+// The PKCS#7 content of an accepted entry is still parsed and verified by the
+// normal verification path; this function only establishes that the table
+// itself contains no data outside the sequence of declared entries.
+func validateCertificateTable(table []byte) error {
+	off := 0
+	for off < len(table) {
+		// A remainder smaller than a header means the table was truncated or
+		// its declared size does not match the entries it contains.
+		if len(table)-off < signature.SizeofWINCertificate {
+			return fmt.Errorf("%w: %d trailing byte(s) at offset 0x%x are too small for a WIN_CERTIFICATE header", ErrCertificateTable, len(table)-off, off)
+		}
+
+		// Every entry has to start on an 8-byte boundary.
+		if off%8 != 0 {
+			return fmt.Errorf("%w: WIN_CERTIFICATE at offset 0x%x is not 8-byte aligned", ErrCertificateTable, off)
+		}
+
+		entryLength := int(binary.LittleEndian.Uint32(table[off:]))
+		revision := binary.LittleEndian.Uint16(table[off+4:])
+		certType := signature.WINCertType(binary.LittleEndian.Uint16(table[off+6:]))
+
+		if entryLength < signature.SizeofWINCertificate {
+			return fmt.Errorf("%w: WIN_CERTIFICATE at offset 0x%x declares length %d, smaller than the %d byte header", ErrCertificateTable, off, entryLength, signature.SizeofWINCertificate)
+		}
+
+		// The entry must be fully contained in the declared table. An
+		// overshooting length is the classic way to append parseable but
+		// unauthenticated data behind a valid signature.
+		if entryLength > len(table)-off {
+			return fmt.Errorf("%w: WIN_CERTIFICATE at offset 0x%x declares length %d but only %d bytes remain in the table", ErrCertificateTable, off, entryLength, len(table)-off)
+		}
+
+		if revision != signature.WIN_CERTIFICATE_REVISION {
+			return fmt.Errorf("%w: WIN_CERTIFICATE at offset 0x%x has unsupported revision 0x%x (want 0x%x)", ErrCertificateTable, off, revision, signature.WIN_CERTIFICATE_REVISION)
+		}
+
+		// Only the PE/COFF documented types are accepted. An unknown type is
+		// unsigned data wearing a certificate header.
+		switch certType {
+		case signature.WIN_CERT_TYPE_PKCS_SIGNED_DATA,
+			signature.WIN_CERT_TYPE_EFI_PKCS1_15,
+			signature.WIN_CERT_TYPE_EFI_GUID:
+		default:
+			return fmt.Errorf("%w: WIN_CERTIFICATE at offset 0x%x has unknown certificate type 0x%x", ErrCertificateTable, off, uint16(certType))
+		}
+
+		if entryLength == signature.SizeofWINCertificate {
+			return fmt.Errorf("%w: WIN_CERTIFICATE at offset 0x%x contains no certificate data", ErrCertificateTable, off)
+		}
+
+		// Advance past the entry and its zero-filled alignment padding. The
+		// next entry (or the end of the table) must sit on an 8-byte boundary.
+		nextOff := (off + entryLength + 7) &^ 7
+		if nextOff > len(table) {
+			return fmt.Errorf("%w: WIN_CERTIFICATE at offset 0x%x (length %d) is padded past the end of the %d byte table", ErrCertificateTable, off, entryLength, len(table))
+		}
+		for _, padByte := range table[off+entryLength : nextOff] {
+			if padByte != 0 {
+				return fmt.Errorf("%w: non-zero padding byte 0x%x after WIN_CERTIFICATE at offset 0x%x", ErrCertificateTable, padByte, off)
+			}
+		}
+		off = nextOff
+	}
+
+	return nil
+}
+
 // Signatures returns a slice of *signature.WINCertificate which contains the
 // WINCert wrapped Authenticode signatures.
 func (p *PECOFFBinary) Signatures() ([]*signature.WINCertificate, error) {
 	var signatures []*signature.WINCertificate
 
-	reader := bytes.NewReader(p.signatureBytes())
-	for reader.Len() > signature.SizeofWINCertificate {
+	// Re-validate the table bounds on every read. AppendSignature rebuilds the
+	// table itself, but a parsed binary must never hand back entries that do
+	// not fully fit inside the declared certificate table.
+	table := p.signatureBytes()
+	if err := validateCertificateTable(table); err != nil {
+		return nil, err
+	}
+
+	reader := bytes.NewReader(table)
+	for reader.Len() >= signature.SizeofWINCertificate {
 		sig, err := signature.ReadWinCertificate(reader)
 		if err != nil {
 			return []*signature.WINCertificate{}, errors.Wrap(err, "couldn't parse signature")
 		}
 		signatures = append(signatures, &sig)
 
-		// All wCerts are padded up to 8 bytes
-		// this figures out the padding and removes the bytes
-		// so we don't parse them.
+		// All wCerts are padded up to 8 bytes. validateCertificateTable
+		// already proved the padding exists and consists of zeroes; consume
+		// exactly that many bytes so the walk stays within table bounds.
 		_, size := PaddingBytes(int(sig.Length), 8)
-		reader.Read(make([]byte, size))
+		if _, err := io.CopyN(io.Discard, reader, int64(size)); err != nil {
+			return nil, fmt.Errorf("%w: failed consuming WIN_CERTIFICATE padding: %v", ErrCertificateTable, err)
+		}
 	}
+
+	if reader.Len() != 0 {
+		return nil, fmt.Errorf("%w: %d unparseable byte(s) remain after the last WIN_CERTIFICATE entry", ErrCertificateTable, reader.Len())
+	}
+
 	return signatures, nil
 }
 
