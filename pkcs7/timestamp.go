@@ -2,6 +2,7 @@ package pkcs7
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -378,8 +379,15 @@ func parseTSAResp(data []byte) (*TSAResp, error) {
 	return resp, nil
 }
 
-// GetTimestamp requests a timestamp for the given message imprint
+// GetTimestamp requests a timestamp for the given message imprint.
+// The message imprint is assumed to be a SHA-256 digest.
 func GetTimestamp(tsaURL string, messageImprint []byte) ([]byte, error) {
+	return GetTimestampWithHash(tsaURL, messageImprint, crypto.SHA256)
+}
+
+// GetTimestampWithHash requests a timestamp for the given message imprint,
+// declaring hashAlg as the digest algorithm of the imprint.
+func GetTimestampWithHash(tsaURL string, messageImprint []byte, hash crypto.Hash) ([]byte, error) {
 	if tsaURL == "" {
 		return nil, errors.New("TSA URL is required")
 	}
@@ -390,9 +398,14 @@ func GetTimestamp(tsaURL string, messageImprint []byte) ([]byte, error) {
 		return nil, fmt.Errorf("invalid TSA URL: %w", err)
 	}
 
-	// Create hash algorithm identifier for SHA256
+	oid, err := DigestAlgorithmOID(hash)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create hash algorithm identifier
 	hashAlg := pkix.AlgorithmIdentifier{
-		Algorithm:  OIDDigestAlgorithmSHA256,
+		Algorithm:  oid,
 		Parameters: encasn1.RawValue{Tag: 5}, // ASN.1 NULL
 	}
 

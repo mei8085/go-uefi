@@ -3,7 +3,11 @@ package pkcs7
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/rsa"
+	_ "crypto/sha256"
+	_ "crypto/sha512"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
@@ -19,24 +23,106 @@ import (
 
 // OID data we need
 var (
-	OIDData                        = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 1}
-	OIDSignedData                  = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 2}
-	OIDDigestAlgorithmSHA256       = encasn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
-	OIDDigestAlgorithmSHA384       = encasn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}
-	OIDDigestAlgorithmSHA512       = encasn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 3}
-	OIDEncryptionAlgorithmRSA      = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
-	OIDAttributeContentType        = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 3}
-	OIDAttributeMessageDigest      = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
-	OIDAttributeSigningTime        = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 5}
-	OIDAttributeTSTInfo            = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 1, 4}
-	OIDAttributeRFC3161TimeStamp   = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 2, 14}
-	OIDAttributeMicrosoftTimeStamp = encasn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 3, 3, 1}
+	OIDData                          = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 1}
+	OIDSignedData                    = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 7, 2}
+	OIDDigestAlgorithmSHA256         = encasn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
+	OIDDigestAlgorithmSHA384         = encasn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 2}
+	OIDDigestAlgorithmSHA512         = encasn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 3}
+	OIDEncryptionAlgorithmRSA        = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
+	OIDEncryptionAlgorithmECDSA      = encasn1.ObjectIdentifier{1, 2, 840, 10045, 2, 1}
+	OIDSignatureAlgorithmSHA256RSA   = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 11}
+	OIDSignatureAlgorithmSHA384RSA   = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 12}
+	OIDSignatureAlgorithmSHA512RSA   = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 13}
+	OIDSignatureAlgorithmECDSASHA256 = encasn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 2}
+	OIDSignatureAlgorithmECDSASHA384 = encasn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 3}
+	OIDSignatureAlgorithmECDSASHA512 = encasn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 4}
+	OIDAttributeContentType          = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 3}
+	OIDAttributeMessageDigest        = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
+	OIDAttributeSigningTime          = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 5}
+	OIDAttributeTSTInfo              = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 1, 4}
+	OIDAttributeRFC3161TimeStamp     = encasn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 16, 2, 14}
+	OIDAttributeMicrosoftTimeStamp   = encasn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 311, 3, 3, 1}
 )
 
 var digestAlgorithmHashFunction = map[string]crypto.Hash{
 	OIDDigestAlgorithmSHA256.String(): crypto.SHA256,
 	OIDDigestAlgorithmSHA384.String(): crypto.SHA384,
 	OIDDigestAlgorithmSHA512.String(): crypto.SHA512,
+}
+
+var hashFunctionDigestAlgorithm = map[crypto.Hash]encasn1.ObjectIdentifier{
+	crypto.SHA256: OIDDigestAlgorithmSHA256,
+	crypto.SHA384: OIDDigestAlgorithmSHA384,
+	crypto.SHA512: OIDDigestAlgorithmSHA512,
+}
+
+// digestEncryptionAlgorithmKeyType maps the digest encryption (signature)
+// algorithm OIDs we accept to the public key algorithm they require.
+var digestEncryptionAlgorithmKeyType = map[string]x509.PublicKeyAlgorithm{
+	OIDEncryptionAlgorithmRSA.String():        x509.RSA,
+	OIDSignatureAlgorithmSHA256RSA.String():   x509.RSA,
+	OIDSignatureAlgorithmSHA384RSA.String():   x509.RSA,
+	OIDSignatureAlgorithmSHA512RSA.String():   x509.RSA,
+	OIDEncryptionAlgorithmECDSA.String():      x509.ECDSA,
+	OIDSignatureAlgorithmECDSASHA256.String(): x509.ECDSA,
+	OIDSignatureAlgorithmECDSASHA384.String(): x509.ECDSA,
+	OIDSignatureAlgorithmECDSASHA512.String(): x509.ECDSA,
+}
+
+// HashForDigestAlgorithm returns the hash function for a digest algorithm OID.
+func HashForDigestAlgorithm(oid encasn1.ObjectIdentifier) (crypto.Hash, bool) {
+	h, ok := digestAlgorithmHashFunction[oid.String()]
+	return h, ok
+}
+
+// DigestAlgorithmOID returns the digest algorithm OID for a hash function.
+func DigestAlgorithmOID(h crypto.Hash) (encasn1.ObjectIdentifier, error) {
+	oid, ok := hashFunctionDigestAlgorithm[h]
+	if !ok {
+		return nil, fmt.Errorf("unsupported digest algorithm: %v", h)
+	}
+	return oid, nil
+}
+
+// signatureAlgorithm selects the x509 signature algorithm matching the given
+// digest algorithm and public key type.
+func signatureAlgorithm(h crypto.Hash, pub any) (x509.SignatureAlgorithm, error) {
+	switch pub.(type) {
+	case *rsa.PublicKey:
+		switch h {
+		case crypto.SHA256:
+			return x509.SHA256WithRSA, nil
+		case crypto.SHA384:
+			return x509.SHA384WithRSA, nil
+		case crypto.SHA512:
+			return x509.SHA512WithRSA, nil
+		}
+	case *ecdsa.PublicKey:
+		switch h {
+		case crypto.SHA256:
+			return x509.ECDSAWithSHA256, nil
+		case crypto.SHA384:
+			return x509.ECDSAWithSHA384, nil
+		case crypto.SHA512:
+			return x509.ECDSAWithSHA512, nil
+		}
+	default:
+		return x509.UnknownSignatureAlgorithm, fmt.Errorf("unsupported public key type %T", pub)
+	}
+	return x509.UnknownSignatureAlgorithm, fmt.Errorf("unsupported digest algorithm: %v", h)
+}
+
+// encryptionAlgorithmOID returns the digest encryption algorithm OID matching
+// the public key type of the signer.
+func encryptionAlgorithmOID(pub any) (encasn1.ObjectIdentifier, error) {
+	switch pub.(type) {
+	case *rsa.PublicKey:
+		return OIDEncryptionAlgorithmRSA, nil
+	case *ecdsa.PublicKey:
+		return OIDEncryptionAlgorithmECDSA, nil
+	default:
+		return nil, fmt.Errorf("unsupported public key type %T", pub)
+	}
 }
 
 // Common errors
@@ -61,6 +147,7 @@ type Config struct {
 	AdditionalCerts          []*x509.Certificate
 	TimestampURL             string
 	UseMicrosoftTimestampOID bool
+	DigestAlgorithm          crypto.Hash
 }
 
 type Option func(*Config)
@@ -100,6 +187,15 @@ func WithAuthenticodeTimestamp(tsaURL string) Option {
 	}
 }
 
+// WithDigestAlgorithm selects the digest algorithm used when creating the
+// signature. Supported values are SHA-256, SHA-384 and SHA-512.
+// Defaults to SHA-256.
+func WithDigestAlgorithm(alg crypto.Hash) Option {
+	return func(c *Config) {
+		c.DigestAlgorithm = alg
+	}
+}
+
 // VerifyTimestamp enables checking the signing certificate for expiry when verifying a signature.
 // If the signing certificate is expired, the Authenticode or RFC3161 timestamp is verified.
 //
@@ -121,9 +217,24 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 		optFunc(config)
 	}
 
+	hashAlg := config.DigestAlgorithm
+	if hashAlg == 0 {
+		hashAlg = crypto.SHA256
+	}
+
+	digestOID, err := DigestAlgorithmOID(hashAlg)
+	if err != nil {
+		return nil, err
+	}
+
+	encryptionOID, err := encryptionAlgorithmOID(signer.Public())
+	if err != nil {
+		return nil, err
+	}
+
 	var contentInfo cryptobyte.Builder
 
-	h := crypto.SHA256.New()
+	h := hashAlg.New()
 	h.Write(content)
 	contentDigest := h.Sum(nil)
 
@@ -142,20 +253,20 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 		}
 
 		attributes = attrs.Marshal()
-		h = crypto.SHA256.New()
+		h = hashAlg.New()
 		h.Write(attributes)
 	}
 
-	sig, err := signer.Sign(rand.Reader, h.Sum(nil), crypto.SHA256)
+	sig, err := signer.Sign(rand.Reader, h.Sum(nil), hashAlg)
 	if err != nil {
 		return nil, err
 	}
 
 	var timestamp []byte
 	if config.TimestampURL != "" {
-		sigHash := crypto.SHA256.New()
+		sigHash := hashAlg.New()
 		sigHash.Write(sig)
-		timestamp, err = GetTimestamp(config.TimestampURL, sigHash.Sum(nil))
+		timestamp, err = GetTimestampWithHash(config.TimestampURL, sigHash.Sum(nil), hashAlg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get timestamp for unauthenticated attributes: %w", err)
 		}
@@ -182,8 +293,7 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 					// AlgorithmIdentifier  ::=  SEQUENCE
 					b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
 						//   algorithm               OBJECT IDENTIFIER,
-						// NOTE: Only sha256 hardcoded atm
-						b.AddASN1ObjectIdentifier(OIDDigestAlgorithmSHA256)
+						b.AddASN1ObjectIdentifier(digestOID)
 						//   parameters              ANY DEFINED BY algorithm OPTIONAL
 						b.AddASN1NULL()
 					})
@@ -246,8 +356,7 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 						// digestAlgorithm DigestAlgorithmIdentifier
 						b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
 							//   algorithm               OBJECT IDENTIFIER,
-							// NOTE: Only sha256 hardcoded atm
-							b.AddASN1ObjectIdentifier(OIDDigestAlgorithmSHA256)
+							b.AddASN1ObjectIdentifier(digestOID)
 							//   parameters              ANY DEFINED BY algorithm OPTIONAL
 							b.AddASN1NULL()
 						})
@@ -265,7 +374,7 @@ func SignPKCS7(signer crypto.Signer, cert *x509.Certificate, oid encasn1.ObjectI
 						// digestEncryptionAlgorithm DigestEncryptionAlgorithmIdentifier
 						b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
 							//   algorithm               OBJECT IDENTIFIER,
-							b.AddASN1ObjectIdentifier(OIDEncryptionAlgorithmRSA)
+							b.AddASN1ObjectIdentifier(encryptionOID)
 							//   parameters              ANY DEFINED BY algorithm OPTIONAL
 							b.AddASN1NULL()
 						})
@@ -577,8 +686,29 @@ type signerinfo struct {
 
 func (s *signerinfo) verify(cert *x509.Certificate) (bool, error) {
 	sigdata := s.AuthenticatedAttributes.RawBytes
-	err := cert.CheckSignature(x509.SHA256WithRSA, sigdata, s.EncryptedDigest)
+
+	hashAlg, ok := HashForDigestAlgorithm(s.DigestAlgorithm.Algorithm)
+	if !ok {
+		return false, fmt.Errorf("unsupported digest algorithm: %s", s.DigestAlgorithm.Algorithm.String())
+	}
+
+	// The digest encryption algorithm has to match the key type of the
+	// certificate we verify against.
+	keyType, ok := digestEncryptionAlgorithmKeyType[s.EncryptedDigestAlgorithm.Algorithm.String()]
+	if !ok {
+		return false, fmt.Errorf("unsupported digest encryption algorithm: %s", s.EncryptedDigestAlgorithm.Algorithm.String())
+	}
+	if keyType != cert.PublicKeyAlgorithm {
+		return false, fmt.Errorf("digest encryption algorithm %s does not match certificate public key algorithm %s",
+			s.EncryptedDigestAlgorithm.Algorithm.String(), cert.PublicKeyAlgorithm)
+	}
+
+	sigAlg, err := signatureAlgorithm(hashAlg, cert.PublicKey)
 	if err != nil {
+		return false, err
+	}
+
+	if err := cert.CheckSignature(sigAlg, sigdata, s.EncryptedDigest); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -599,7 +729,11 @@ func (s *signerinfo) verifyTimestamp(cert *x509.Certificate, opts ...VerifyOptio
 		return false, errors.New("no timestamp token found in unauthenticated attributes")
 	}
 
-	h := digestAlgorithmHashFunction[s.DigestAlgorithm.Algorithm.String()].New()
+	hashAlg, ok := HashForDigestAlgorithm(s.DigestAlgorithm.Algorithm)
+	if !ok {
+		return false, fmt.Errorf("unsupported digest algorithm: %s", s.DigestAlgorithm.Algorithm.String())
+	}
+	h := hashAlg.New()
 	h.Write(s.EncryptedDigest) // message imprint inside the timestamp token
 	imprintHash := h.Sum(nil)
 
@@ -638,7 +772,11 @@ func (p *PKCS7) verifyHash(si *signerinfo) (bool, error) {
 	if !content.ReadASN1(&spcIndirectDataContent, asn1.SEQUENCE) || !content.Empty() {
 		return false, errors.New("malformed SpcIndirectDataContent")
 	}
-	hh := crypto.SHA256.New()
+	hashAlg, ok := HashForDigestAlgorithm(si.DigestAlgorithm.Algorithm)
+	if !ok {
+		return false, fmt.Errorf("unsupported digest algorithm: %s", si.DigestAlgorithm.Algorithm.String())
+	}
+	hh := hashAlg.New()
 	hh.Write(spcIndirectDataContent)
 	if bytes.Equal(si.AuthenticatedAttributes.MessageDigest, hh.Sum(nil)) {
 		return true, nil

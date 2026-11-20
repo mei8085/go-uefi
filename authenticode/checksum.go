@@ -259,8 +259,17 @@ func (p *PECOFFBinary) AppendSignature(sig []byte) error {
 
 // Sign the PE/COFF binary and return the signature.
 // .Bytes() will return the binary with the signature appended.
+// The signature is created with SHA-256 as the digest algorithm.
 func (p *PECOFFBinary) Sign(key crypto.Signer, cert *x509.Certificate, opts ...pkcs7.Option) ([]byte, error) {
-	sig, err := SignAuthenticode(key, cert, makeSectionReader(p.hashContent), crypto.SHA256, opts...)
+	return p.SignWithHash(key, cert, crypto.SHA256, opts...)
+}
+
+// SignWithHash signs the PE/COFF binary with the given digest algorithm and
+// returns the signature. Supported digest algorithms are SHA-256, SHA-384 and
+// SHA-512.
+// .Bytes() will return the binary with the signature appended.
+func (p *PECOFFBinary) SignWithHash(key crypto.Signer, cert *x509.Certificate, alg crypto.Hash, opts ...pkcs7.Option) ([]byte, error) {
+	sig, err := SignAuthenticode(key, cert, makeSectionReader(p.hashContent), alg, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed signing binary: %w", err)
 	}

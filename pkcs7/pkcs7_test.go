@@ -2,6 +2,7 @@ package pkcs7
 
 import (
 	"crypto"
+	"crypto/x509"
 	encasn1 "encoding/asn1"
 	"fmt"
 	"log"
@@ -99,4 +100,119 @@ func TestCompareOldImplementation(t *testing.T) {
 
 	// We should see a couple of differences, but largely the same structure should be present
 	asntest.Asn1Compare(t, b, bytes)
+}
+
+func TestVerifySignatureAlgorithms(t *testing.T) {
+	rsaCert, rsaKey := certtest.MkCert(t)
+	ecdsaKey, ecdsaCert := certtest.MkSelfSignedECDSACert(t)
+
+	for _, c := range []struct {
+		name   string
+		signer crypto.Signer
+		cert   *x509.Certificate
+		hash   crypto.Hash
+	}{
+		{"RSA/SHA-256", rsaKey, rsaCert, crypto.SHA256},
+		{"RSA/SHA-384", rsaKey, rsaCert, crypto.SHA384},
+		{"RSA/SHA-512", rsaKey, rsaCert, crypto.SHA512},
+		{"ECDSA/SHA-256", ecdsaKey, ecdsaCert, crypto.SHA256},
+		{"ECDSA/SHA-384", ecdsaKey, ecdsaCert, crypto.SHA384},
+		{"ECDSA/SHA-512", ecdsaKey, ecdsaCert, crypto.SHA512},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			data := []byte{0x00, 0x01}
+			b, err := SignPKCS7(c.signer, c.cert, OIDData, data, WithDigestAlgorithm(c.hash))
+			if err != nil {
+				t.Fatalf("failed signing: %v", err)
+			}
+			pkcs, err := ParsePKCS7(b)
+			if err != nil {
+				t.Fatalf("failed parsing PKCS7 signature: %v", err)
+			}
+
+			if !pkcs.AlgorithmIdentifier.Algorithm.Equal(hashFunctionDigestAlgorithm[c.hash]) {
+				t.Fatalf("unexpected digest algorithm in SignedData: %s", pkcs.AlgorithmIdentifier.Algorithm)
+			}
+
+			ok, err := pkcs.Verify(c.cert)
+			if err != nil {
+				t.Fatalf("failed verifying signature: %v", err)
+			}
+			if !ok {
+				t.Fatalf("Signature should validate")
+			}
+		})
+	}
+}
+
+func TestSignPKCS7UnsupportedDigestAlgorithm(t *testing.T) {
+	cert, key := certtest.MkCert(t)
+
+	if _, err := SignPKCS7(key, cert, OIDData, []byte{0x00}, WithDigestAlgorithm(crypto.SHA1)); err == nil {
+		t.Fatalf("expected an error when signing with an unsupported digest algorithm")
+	}
+}
+
+func TestVerifyRejectsMismatchedKeyAlgorithm(t *testing.T) {
+	rsaCert, rsaKey := certtest.MkCert(t)
+	ecdsaKey, ecdsaCert := certtest.MkSelfSignedECDSACert(t)
+
+	for _, c := range []struct {
+		name        string
+		signer      crypto.Signer
+		cert        *x509.Certificate
+		tamperedOID encasn1.ObjectIdentifier
+	}{
+		// An RSA signature claiming to be an ECDSA signature
+		{"RSA signature with ECDSA algorithm", rsaKey, rsaCert, OIDEncryptionAlgorithmECDSA},
+		// An ECDSA signature claiming to be an RSA signature
+		{"ECDSA signature with RSA algorithm", ecdsaKey, ecdsaCert, OIDEncryptionAlgorithmRSA},
+		// An unknown digest encryption algorithm
+		{"RSA signature with unknown algorithm", rsaKey, rsaCert, encasn1.ObjectIdentifier{1, 2, 3, 4}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			b, err := SignPKCS7(c.signer, c.cert, OIDData, []byte{0x00, 0x01})
+			if err != nil {
+				t.Fatalf("failed signing: %v", err)
+			}
+			pkcs, err := ParsePKCS7(b)
+			if err != nil {
+				t.Fatalf("failed parsing PKCS7 signature: %v", err)
+			}
+
+			pkcs.SignerInfo[0].EncryptedDigestAlgorithm.Algorithm = c.tamperedOID
+
+			ok, err := pkcs.Verify(c.cert)
+			if err == nil {
+				t.Fatalf("expected an error when the digest encryption algorithm doesn't match the key type")
+			}
+			if ok {
+				t.Fatalf("signature should not validate")
+			}
+		})
+	}
+}
+
+func TestVerifyRejectsUnsupportedDigestAlgorithm(t *testing.T) {
+	cert, key := certtest.MkCert(t)
+
+	b, err := SignPKCS7(key, cert, OIDData, []byte{0x00, 0x01})
+	if err != nil {
+		t.Fatalf("failed signing: %v", err)
+	}
+	pkcs, err := ParsePKCS7(b)
+	if err != nil {
+		t.Fatalf("failed parsing PKCS7 signature: %v", err)
+	}
+
+	// SHA-1 is not a supported digest algorithm
+	pkcs.SignerInfo[0].DigestAlgorithm.Algorithm = encasn1.ObjectIdentifier{1, 3, 14, 3, 2, 26}
+
+	ok, err := pkcs.Verify(cert)
+	if err == nil {
+		t.Fatalf("expected an error when the digest algorithm is unsupported")
+	}
+	if ok {
+		t.Fatalf("signature should not validate")
+	}
 }

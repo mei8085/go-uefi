@@ -6,6 +6,8 @@ package authenticode
 import (
 	"bytes"
 	"crypto"
+	_ "crypto/sha256"
+	_ "crypto/sha512"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	encasn1 "encoding/asn1"
@@ -40,6 +42,10 @@ func (a *Authenticode) Verify(cert *x509.Certificate, img io.Reader, opts ...pkc
 	switch {
 	case a.Algid.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA256):
 		h = crypto.SHA256.New()
+	case a.Algid.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA384):
+		h = crypto.SHA384.New()
+	case a.Algid.Algorithm.Equal(pkcs7.OIDDigestAlgorithmSHA512):
+		h = crypto.SHA512.New()
 	default:
 		return false, errors.New("unsupported hashing function")
 	}
@@ -63,6 +69,11 @@ func (a *Authenticode) Verify(cert *x509.Certificate, img io.Reader, opts ...pkc
 // specified int he Authenticode standard.
 func CreateSpcIndirectDataContent(digest []byte, alg crypto.Hash) ([]byte, error) {
 	var b cryptobyte.Builder
+
+	digestOID, err := pkcs7.DigestAlgorithmOID(alg)
+	if err != nil {
+		return nil, err
+	}
 
 	//		data           SpcAttributeTypeAndOptionalValue,
 	b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
@@ -115,7 +126,7 @@ func CreateSpcIndirectDataContent(digest []byte, alg crypto.Hash) ([]byte, error
 		b.AddASN1(asn1.SEQUENCE, func(b *cryptobyte.Builder) {
 
 			//		digestAlgorithm  AlgorithmIdentifier,
-			b.AddASN1ObjectIdentifier(pkcs7.OIDDigestAlgorithmSHA256)
+			b.AddASN1ObjectIdentifier(digestOID)
 
 			// Add explicit null, I believe it's needed by picky UEFI things
 			b.AddASN1NULL()
@@ -131,6 +142,10 @@ func CreateSpcIndirectDataContent(digest []byte, alg crypto.Hash) ([]byte, error
 // SignAuthenticode signs a digest with the SPC Indirect Data Content as
 // specified by the authenticode standard.
 func SignAuthenticode(signer crypto.Signer, cert *x509.Certificate, digest io.Reader, alg crypto.Hash, opts ...pkcs7.Option) ([]byte, error) {
+	if _, err := pkcs7.DigestAlgorithmOID(alg); err != nil {
+		return nil, err
+	}
+
 	h := alg.New()
 
 	if _, err := io.Copy(h, digest); err != nil {
@@ -141,6 +156,7 @@ func SignAuthenticode(signer crypto.Signer, cert *x509.Certificate, digest io.Re
 	if err != nil {
 		return nil, fmt.Errorf("failed creating SpcIndirectDataContent: %w", err)
 	}
+	opts = append([]pkcs7.Option{pkcs7.WithDigestAlgorithm(alg)}, opts...)
 	return pkcs7.SignPKCS7(signer, cert, OIDSpcIndirectDataContent, b, opts...)
 }
 
