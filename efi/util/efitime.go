@@ -33,6 +33,39 @@ func (e *EFITime) Format() string {
 	return fmt.Sprintf("%d-%d-%d %d:%d:%d:%d", e.Year, e.Month, e.Day, e.Hour, e.Minute, e.Second, e.Nanosecond)
 }
 
+// Compare compares two EFITime timestamps by their wall-clock fields. The
+// Pad, TimeZone and Daylight fields are ignored. It returns -1 if e is
+// before o, 0 if they are equal and 1 if e is after o.
+func (e EFITime) Compare(o EFITime) int {
+	fields := func(t EFITime) []uint64 {
+		return []uint64{
+			uint64(t.Year), uint64(t.Month), uint64(t.Day),
+			uint64(t.Hour), uint64(t.Minute), uint64(t.Second),
+			uint64(t.Nanosecond),
+		}
+	}
+	a, b := fields(e), fields(o)
+	for i := range a {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	return 0
+}
+
+// Before returns true if e is strictly before o.
+func (e EFITime) Before(o EFITime) bool {
+	return e.Compare(o) < 0
+}
+
+// After returns true if e is strictly after o.
+func (e EFITime) After(o EFITime) bool {
+	return e.Compare(o) > 0
+}
+
 type EFITImeCapabilitie struct {
 	Resolution uint32
 	Accuracy   uint32

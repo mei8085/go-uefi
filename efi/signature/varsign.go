@@ -63,6 +63,9 @@ func ReadWinCertificate(f io.Reader) (WINCertificate, error) {
 	if cert.Revision != WIN_CERTIFICATE_REVISION {
 		return WINCertificate{}, errors.Wrapf(ErrParse, "WINCertificate revision should be %x, but is %x. Malformed or invalid", WIN_CERTIFICATE_REVISION, cert.Revision)
 	}
+	if cert.Length < SizeofWINCertificate {
+		return WINCertificate{}, errors.Wrapf(ErrParse, "WINCertificate length %d is smaller than the header size %d. Malformed or invalid", cert.Length, SizeofWINCertificate)
+	}
 	certLength := make([]byte, cert.Length-SizeofWINCertificate)
 	if err := binary.Read(f, binary.LittleEndian, certLength); err != nil {
 		return WINCertificate{}, errors.Wrapf(err, "could not get signature data")
@@ -103,11 +106,11 @@ func ReadWinCertificateUEFIGUID(f io.Reader) (WinCertificateUEFIGUID, error) {
 	cert.Header = hdr
 	reader := bytes.NewBuffer(cert.Header.Certificate)
 	if err := binary.Read(reader, binary.LittleEndian, &cert.CertType); err != nil {
-		log.Fatal(err)
+		return WinCertificateUEFIGUID{}, errors.Wrap(err, "could not parse WINCert UEFI_GUID CertType")
 	}
 	rbuf := make([]byte, reader.Len())
 	if err := binary.Read(reader, binary.LittleEndian, rbuf); err != nil {
-		log.Fatal(err)
+		return WinCertificateUEFIGUID{}, errors.Wrap(err, "could not parse WINCert UEFI_GUID CertData")
 	}
 	cert.CertData = rbuf[:]
 	return cert, nil
@@ -193,13 +196,15 @@ func (e efibytes) Bytes() []byte {
 	return b.Bytes()
 }
 
-func SignEFIVariable(v efivar.Efivar, m efivar.Marshallable, key crypto.Signer, cert *x509.Certificate) (*EFIVariableAuthentication2, efivar.Marshallable, error) {
-	authvar := NewEFIVariableAuthentication2()
-
-	// Bytes of the signaturedatabase (probably)
-	var sb bytes.Buffer
-
-	// Buffer for the bytes we are signing
+// SignedContent returns the canonical byte representation covered by the
+// PKCS7 signature of an EFI_VARIABLE_AUTHENTICATION2 descriptor:
+//
+//	VariableName (UTF-16LE, without terminator) || VendorGuid || Attributes || Time || Data
+//
+// Verification of an authenticated variable update must recompute this exact
+// encoding. Any reordering or re-encoding of the fields changes the digest
+// and invalidates the signature.
+func SignedContent(v efivar.Efivar, t util.EFITime, data []byte) []byte {
 	var buf bytes.Buffer
 
 	s := []byte{}
@@ -207,23 +212,43 @@ func SignEFIVariable(v efivar.Efivar, m efivar.Marshallable, key crypto.Signer, 
 		s = append(s, n, 0x00)
 	}
 
-	// Marshal the bytes so we can include them in for our signed data
-	m.Marshal(&sb)
-
 	writeOrder := []interface{}{
 		s,
 		*v.GUID,
 		v.Attributes,
-		authvar.Time,
-		sb.Bytes(),
+		t,
+		data,
 	}
 	for _, d := range writeOrder {
-		if err := binary.Write(&buf, binary.LittleEndian, d); err != nil {
-			log.Fatal(err)
-		}
+		// Writing to a bytes.Buffer can not fail
+		_ = binary.Write(&buf, binary.LittleEndian, d)
+	}
+	return buf.Bytes()
+}
+
+func SignEFIVariable(v efivar.Efivar, m efivar.Marshallable, key crypto.Signer, cert *x509.Certificate) (*EFIVariableAuthentication2, efivar.Marshallable, error) {
+	return SignEFIVariableWithOptions(v, m, key, cert, nil)
+}
+
+// SignEFIVariableWithOptions signs an EFI variable update like SignEFIVariable,
+// but allows overriding the timestamp of the authentication descriptor (a nil
+// timestamp uses the current time) and passing options to the PKCS7 signer,
+// e.g. pkcs7.WithAdditionalCerts to embed an intermediate certificate chain.
+func SignEFIVariableWithOptions(v efivar.Efivar, m efivar.Marshallable, key crypto.Signer, cert *x509.Certificate, t *util.EFITime, opts ...pkcs7.Option) (*EFIVariableAuthentication2, efivar.Marshallable, error) {
+	authvar := NewEFIVariableAuthentication2()
+	if t != nil {
+		authvar.Time = *t
 	}
 
-	der, err := pkcs7.SignPKCS7(key, cert, pkcs7.OIDData, buf.Bytes())
+	// Bytes of the signaturedatabase (probably)
+	var sb bytes.Buffer
+
+	// Marshal the bytes so we can include them in for our signed data
+	m.Marshal(&sb)
+
+	buf := SignedContent(v, authvar.Time, sb.Bytes())
+
+	der, err := pkcs7.SignPKCS7(key, cert, pkcs7.OIDData, buf, opts...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -250,15 +275,18 @@ func SignEFIVariable(v efivar.Efivar, m efivar.Marshallable, key crypto.Signer, 
 func ReadEFIVariableAuthencation2(f io.Reader) (*EFIVariableAuthentication2, error) {
 	var efi EFIVariableAuthentication2
 	if err := binary.Read(f, binary.LittleEndian, &efi.Time); err != nil {
-		log.Fatal(err)
+		return nil, errors.Wrap(err, "could not parse EFI_VARIABLE_AUTHENTICATION2 timestamp")
 	}
 	authinfo, err := ReadWinCertificateUEFIGUID(f)
 	if err != nil {
-		return &EFIVariableAuthentication2{}, errors.Wrap(err, "could not parse WINCertificate UEFI_GUID")
+		return nil, errors.Wrap(err, "could not parse WINCertificate UEFI_GUID")
 	}
 	efi.AuthInfo = authinfo
 	if efi.AuthInfo.Header.CertType != WIN_CERT_TYPE_EFI_GUID {
-		log.Fatalf("EFI_VARIABLE_AUTHENTICATION2 accepts only CertType WIN_CERT_TYPE_EFI_GUID. Got: %x", efi.AuthInfo.CertType)
+		return nil, errors.Wrapf(ErrParse, "EFI_VARIABLE_AUTHENTICATION2 accepts only CertType WIN_CERT_TYPE_EFI_GUID. Got: %x", efi.AuthInfo.Header.CertType)
+	}
+	if !util.CmpEFIGUID(efi.AuthInfo.CertType, EFI_CERT_TYPE_PKCS7_GUID) {
+		return nil, errors.Wrapf(ErrParse, "EFI_VARIABLE_AUTHENTICATION2 accepts only CertData of type EFI_CERT_TYPE_PKCS7_GUID. Got: %s", efi.AuthInfo.CertType.Format())
 	}
 	return &efi, nil
 }

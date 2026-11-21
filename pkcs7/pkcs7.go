@@ -687,6 +687,66 @@ func (p *PKCS7) HasCertificate(cert *x509.Certificate) bool {
 	return false
 }
 
+// SignerCertificates returns the embedded certificates that are referenced by
+// a SignerInfo in the PKCS7 structure.
+func (p *PKCS7) SignerCertificates() []*x509.Certificate {
+	var certs []*x509.Certificate
+	for _, si := range p.SignerInfo {
+		for _, cert := range p.Certs {
+			if si.isCertificate(cert) {
+				certs = append(certs, cert)
+			}
+		}
+	}
+	return certs
+}
+
+// VerifyContent verifies a signature over detached content, such as the
+// signed content of an EFI_VARIABLE_AUTHENTICATION2 descriptor.
+//
+// It checks that the digest of content matches the messageDigest
+// authenticated attribute, and that the signature over the authenticated
+// attributes is valid for cert. Because the signature is validated against
+// the raw DER encoding of the authenticated attributes, reordering or
+// re-encoding the attributes invalidates the signature and can not be used
+// to bypass the digest check.
+func (p *PKCS7) VerifyContent(cert *x509.Certificate, content []byte, opts ...VerifyOption) (bool, error) {
+	c := &VerifyConfig{}
+	for _, optFunc := range opts {
+		optFunc(c)
+	}
+
+	for _, si := range p.SignerInfo {
+		if !si.isCertificate(cert) {
+			continue
+		}
+		if si.AuthenticatedAttributes == nil {
+			return false, errors.New("no authenticated attributes")
+		}
+		hash, ok := digestAlgorithmHashFunction[si.DigestAlgorithm.Algorithm.String()]
+		if !ok {
+			return false, fmt.Errorf("unsupported digest algorithm: %s", si.DigestAlgorithm.Algorithm.String())
+		}
+		h := hash.New()
+		h.Write(content)
+		if !bytes.Equal(h.Sum(nil), si.AuthenticatedAttributes.MessageDigest) {
+			return false, errors.New("content digest does not match the authenticated message digest")
+		}
+		ok, err := si.verify(cert)
+		if err != nil {
+			return false, fmt.Errorf("failed validating signature: %w", err)
+		}
+		if !ok {
+			continue
+		}
+		if cert.NotAfter.Before(time.Now()) && c.VerifyTimestamp {
+			return si.verifyTimestamp(cert, opts...)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
 func ParsePKCS7(b []byte) (*PKCS7, error) {
 	var pkcs PKCS7
 
