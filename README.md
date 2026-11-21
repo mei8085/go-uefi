@@ -14,6 +14,7 @@ future UEFI revisions.
 * Microsoft Authenticode signing.
 * A subset of PKCS7
 * Working with EFI_SIGNATURE_LIST and EFI_SIGNATURE_DATABASE.
+* Offline Secure Boot admission: decide if an EFI image executes under a given db/dbx policy, honoring certificate chains, hash entries and revocations.
 * Integration tests utilizing [vmtest](https://github.com/hugelgupf/vmtest) and tianocore.
 * Virtual filesystem support for easier testing.
 
@@ -95,6 +96,50 @@ func main(){
 	file.Sign(key, cert)
 	os.WriteFile("somefile.signed", file.Bytes(), 0644)
 }
+```
+
+## Check if an EFI image is admitted by a Secure Boot policy
+
+The `efi/secureboot` package evaluates an image offline against the authorized
+(`db`) and forbidden (`dbx`) signature databases. A revoked hash or certificate
+in `dbx` always denies the image; otherwise a valid Authenticode chain to a
+certificate in `db`, or a matching image hash in `db`, admits it. The verdict is
+independent of how the databases are encoded or ordered.
+
+```go
+package main
+
+import (
+	"bytes"
+	"os"
+
+	"github.com/foxboron/go-uefi/efi/secureboot"
+	"github.com/foxboron/go-uefi/efi/signature"
+)
+
+func main() {
+	image, _ := os.Open("image.efi")
+	defer image.Close()
+
+	dbBytes, _ := os.ReadFile("db.esl")
+	dbxBytes, _ := os.ReadFile("dbx.esl")
+
+	db, _ := signature.ReadSignatureDatabase(bytes.NewReader(dbBytes))
+	dbx, _ := signature.ReadSignatureDatabase(bytes.NewReader(dbxBytes))
+
+	allowed, err := secureboot.VerifyImageReader(image, &db, &dbx)
+	if err != nil || !allowed {
+		// Image is denied (unsigned, revoked, or untrusted); err explains why.
+		panic(err)
+	}
+}
+```
+
+The `cmd/gosecureboot` command wraps this for shell use:
+
+```sh
+gosecureboot -db db.esl -dbx dbx.esl image.efi
+# prints ALLOWED (exit 0) or DENIED: <reason> (exit 1)
 ```
 
 ## Checksum UEFI executable

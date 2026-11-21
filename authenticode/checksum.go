@@ -297,6 +297,45 @@ func (p *PECOFFBinary) Verify(cert *x509.Certificate, opts ...pkcs7.VerifyOption
 	return false, ErrNoValidSignatures
 }
 
+// VerifyAuthenticode cryptographically validates every Authenticode signature in
+// the binary against the certificates embedded in that signature. A signature is
+// only considered valid when the image digest matches the authenticated digest and
+// the encrypted digest verifies with the embedded signing certificate.
+//
+// It returns the parsed Authenticode structures for the signatures which validated
+// successfully. It never consults any key database: that is a policy decision left
+// to the caller.
+func (p *PECOFFBinary) VerifyAuthenticode(opts ...pkcs7.VerifyOption) ([]*Authenticode, error) {
+	sigs, err := p.Signatures()
+	if err != nil {
+		return nil, fmt.Errorf("failed fetching certificates from binary: %w", err)
+	}
+	if len(sigs) == 0 {
+		return nil, ErrNoSignatures
+	}
+
+	var valid []*Authenticode
+	for _, sig := range sigs {
+		authcode, err := ParseAuthenticode(sig.Certificate)
+		if err != nil {
+			// A malformed signature cannot authorize anything; keep evaluating
+			// the remaining signatures.
+			continue
+		}
+		for _, cert := range authcode.Pkcs.SignerCertificates() {
+			ok, err := authcode.Verify(cert, makeSectionReader(p.hashContent), opts...)
+			if err != nil || !ok {
+				// A digest mismatch, unsupported algorithm or bad signature means
+				// this signature cannot validate. Move on to the next one.
+				continue
+			}
+			valid = append(valid, authcode)
+			break
+		}
+	}
+	return valid, nil
+}
+
 // Bytes returns the binary with any appended signatures
 func (p *PECOFFBinary) Bytes() []byte {
 	b := bytes.NewBuffer(make([]byte, 0, p.firstSection.Size()+

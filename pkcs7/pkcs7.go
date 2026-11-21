@@ -687,6 +687,23 @@ func (p *PKCS7) HasCertificate(cert *x509.Certificate) bool {
 	return false
 }
 
+// SignerCertificates returns the embedded certificates that match each SignerInfo.
+// A SignerInfo without a matching embedded certificate contributes nothing (the
+// resulting slice simply has no entry for it). The returned order follows the
+// SignerInfo order, which is the only ordering the signature itself encodes.
+func (p *PKCS7) SignerCertificates() []*x509.Certificate {
+	var certs []*x509.Certificate
+	for _, si := range p.SignerInfo {
+		for _, cert := range p.Certs {
+			if si.isCertificate(cert) {
+				certs = append(certs, cert)
+				break
+			}
+		}
+	}
+	return certs
+}
+
 func ParsePKCS7(b []byte) (*PKCS7, error) {
 	var pkcs PKCS7
 
