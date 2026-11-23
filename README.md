@@ -51,6 +51,60 @@ func main() {
 }
 ```
 
+## Read and edit signature databases of every type
+
+`SignatureList` and `SignatureDatabase` accept every signature type defined by
+the UEFI specification (SHA-1/224/256/384/512, SM3, the RSA-2048 variants,
+X.509, and the X.509 revocation and external management entries). The length
+rules of each type apply to reading, appending and removing alike, so an entry
+you append is exactly what a later read returns.
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/foxboron/go-uefi/efi/signature"
+	"github.com/foxboron/go-uefi/efi/util"
+)
+
+func main() {
+	db := signature.NewSignatureDatabase()
+
+	hash := make([]byte, 32) // SHA-256 of an image
+	if err := db.Append(signature.CERT_SHA256_GUID, util.EFIGUID{}, hash); err != nil {
+		log.Fatal(err)
+	}
+
+	// PEM certificates are normalized to DER on the way in.
+	pemBytes, _ := os.ReadFile("signing.cert")
+	if err := db.Append(signature.CERT_X509_GUID, util.EFIGUID{}, pemBytes); err != nil {
+		log.Fatal(err)
+	}
+
+	// Failed edits leave the database untouched and return a sentinel error.
+	if err := db.Append(signature.CERT_SHA256_GUID, util.EFIGUID{}, hash[:16]); err != nil {
+		fmt.Println("rejected:", err) // signature data size does not match the signature type
+	}
+
+	// Validate before writing a database assembled by hand.
+	if err := db.Validate(); err != nil {
+		log.Fatal(err)
+	}
+	if err := db.Remove(signature.CERT_SHA256_GUID, util.EFIGUID{}, hash); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+`MaxSignatureListSize` bounds the size a parser is willing to allocate for one
+signature list, and `RegisterSignatureScheme` installs the length rules for a
+signature type that is not handled by default. Both are consulted on every
+operation, so a changed rule applies to subsequent reads and edits.
+
 ## Use a in-memory efivarfs for tests
 
 ```go
